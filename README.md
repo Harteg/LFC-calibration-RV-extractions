@@ -18,6 +18,7 @@
 - Radial velocity extractions are performed in RV_extractions.ipynb.
 - RV_extra_plots.ipynb contains various plots
 
-**Note:** A few LFC exposures are included in the dir expres_tp, while the star spectra data can be found (upon request) on the website for the [EXPRES Stellar-Signals Project](http://exoplanets.astro.yale.edu/science/activity.php).
+**Note:** One LFC exposure is included in the dir expres_tp, while the star spectra data can be found (upon request) on the website for the [EXPRES Stellar-Signals Project](http://exoplanets.astro.yale.edu/science/activity.php).
+
 
 
