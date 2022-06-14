@@ -1,4 +1,4 @@
-# Methods for LFC calibration and radial velocity extractions
+# Methods for LFC calibration and Radial Velocity Extractions
 
 **Bachelor Project of Physics**
 
