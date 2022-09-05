@@ -14,11 +14,6 @@ import pandas as pd
 my_colors_red = "C3"
 my_colors_blue = "C0"
 
-def make_nan_matrix(size):
-    matrix = np.empty((size,size))
-    matrix[:] = np.nan
-    return matrix
-
 def weighted_mean(x, errors):
     m1 = np.sum([x/s**2 for x, s in zip(x, errors)])
     m2 = np.sum([1/(x**2) for x in errors])
@@ -26,13 +21,19 @@ def weighted_mean(x, errors):
     err = np.sqrt(1/np.sum([1/(x**2) for x in errors]))
     return (mean, err)
 
+
+def make_nan_matrix(size):
+    matrix = np.empty((size,size))
+    matrix[:] = np.nan
+    return matrix
+
+
 def compute_rms(x):
     x = x - np.mean(x)
     return np.sqrt(np.sum(x ** 2) / len(x - 1))
 
 
-def compute_coords(filenames):
-    size = len(filenames)
+def compute_coords(size):
     coords = []
     for x in np.arange(size):
         for y in np.arange(x, size):
@@ -46,6 +47,7 @@ SPECTRA_PATH_10700 = "/Users/jakobharteg/Data/10700_spectra/"
 SPECTRA_PATH_26965 = "/Users/jakobharteg/Data/26965_spectra/"
 SPECTRA_PATH_101501 = "/Users/jakobharteg/Data/101501_spectra/"
 SPECTRA_PATH_51PEG = "/Users/jakobharteg/Data/51peg/"
+RV_RESULTS_PATH = "/Users/jakobharteg/kDrive/Uni/Kurser/Bachelorprojekt/Data/rv_results/"
 
 def get_all_spectra_filenames(spectra_path = SPECTRA_PATH_34411):
     """ Returns all filenames of the spectra files in the path speficied in spectra_path"""
@@ -81,13 +83,24 @@ def get_spec_wavel(data, order, continuum_normalized=False, bary_corrected=True)
 
     return data_spec, data_spec_err, data_wavel
 
+def get_filenames_in_dir(dir, must_contain=None, sort_cron_abc=True):
+    filenames = next(walk(dir), (None, None, []))[2]  # [] if no file
+    
+    if sort_cron_abc:
+        filenames = sorted(filenames)
+
+    if must_contain:
+        filenames = [x for x in filenames if must_contain in x]
+
+    filenames = [dir + x for x in filenames] # add path to the filename
+    return filenames
+
 
 def get_spectra_seconds_since_epoch(filename):
     from datetime import datetime
     dt = get_spektra_date_and_time(filename)
     dt_obj = datetime.strptime(dt, '%Y-%m-%d %H:%M:%S')
     return dt_obj.timestamp()
-
 
 def get_spektra_date_and_time(filename):
     """ Returns the date and time of observation for a given fits filename """
@@ -240,7 +253,10 @@ def find_features(filename,
                     is_51_peg = False,                  # 51Peg doesn't have excalibur column so we need different keywords 
                     use_bary_correction = True,         # True if you want to use "wavelength" column filtered by pixel_mask.
                     scale_up_errors = False,            # scale errors by sqrt{3}
-                    custom_error_scale = None           # scale errors by a constant
+                    custom_error_scale = None,          # scale errors by a constant
+                    order_padding=0,                    # pad orders with a number of pixels, so we exclude features found at the edges
+                    apply_order_overlap_masking=False,  # true to crop off the wavelengths at the start of each order which also appeared at the end of the previous order.
+                    correct_for_tellurics=False         # set intensity to 0 for pixels with non-zero tellurics    
     ):
     
     """ Returns list of features x_values (angstrom by default), y_values, y_err_values, x_peak_location, peak_index, order """
@@ -255,7 +271,8 @@ def find_features(filename,
     is_51_peg = ("peg" in filename)
 
     orders = np.arange(0, orders_n)
-    for order in orders:
+    end_x = -1
+    for index, order in enumerate(orders):
         
         if is_51_peg:
             pixel_mask  = fits_data['PIXEL_MASK'][order]
@@ -265,13 +282,6 @@ def find_features(filename,
             continuum   = fits_data['continuum'][order][pixel_mask]
             x           = fits_data['bary_wavelength'][order][pixel_mask]
         elif not use_bary_correction:
-            # pixel_mask  = fits_data['PIXEL_MASK'][order]    # filter by pixel_mask
-            # y           = fits_data['spectrum'][order][pixel_mask]
-            # og_y        = y # copy of original y data before filtering
-            # y_err       = fits_data['uncertainty'][order][pixel_mask]
-            # continuum   = fits_data['continuum'][order][pixel_mask]
-            # x           = fits_data['wavelength'][order][pixel_mask]
-
             excalibur_mask  = fits_data['EXCALIBUR_MASK'][order]    # filter by EXCALIBUR_MASK
             y           = fits_data['spectrum'][order][excalibur_mask]
             og_y        = y # copy of original y data before filtering
@@ -312,8 +322,34 @@ def find_features(filename,
             # print("Order bad:", len(y), "/", len(og_y), "=", len(y) / len(og_y))
             continue
 
+        # Corect for tellurics
+        if correct_for_tellurics:
+            tel = fits_data['tellurics'][order][excalibur_mask][frac_err_mask]
+            y[np.where(tel < 1)] = 1
+
         # Now invert peaks
         y = 1 - y
+
+        # order padding
+        if order_padding > 0:
+            x = x[order_padding:-order_padding]
+            y = y[order_padding:-order_padding]
+            y_err = y_err[order_padding:-order_padding]
+
+        # orders overlap, so we can trim off the wavelengths in the beginning of each order,
+        # which appeared at the end of the previous order. 
+        if apply_order_overlap_masking:
+            if end_x > 0:
+                for j, x_val in enumerate(x):
+                    if x_val > end_x:
+                        x = x[j:]
+                        y = y[j:]
+                        y_err = y_err[j:]
+                        break
+
+            # save last x for next order
+            end_x = x[-1]
+
 
         peaks = func_find_peaks(y, min_peak_dist, min_peak_prominence)
         peak_locs = peaks[0]
@@ -321,7 +357,7 @@ def find_features(filename,
         
         # Plot
         if plot_orders is not None and (plot_orders == order).any() or plot_orders == -1:
-            plt.figure(figsize=(16,3))
+            plt.figure(figsize=(30,3))
             plt.plot(x, y, ".")
             plt.plot(x[peak_locs], peak_height, "o", color="C3", label=f"{order}. order")
             plt.ylabel("1 - Continuum normalized counts")
@@ -513,7 +549,7 @@ def compute_match_filter_mask(matches, max_dist, max_area_diff):
     return np.asarray(mask)
 
 
-def compute_feature_shift(x1, y1, y1_err, peak1, x2, y2, peak2, plot=False, ax=None, return_df=False, interp_size = 1000, return_extra=False):
+def compute_feature_shift(x1, y1, y1_err, peak1, x2, y2, peak2, plot=False, ax=None, return_df=False, interp_size = 1000, return_extra=False, return_minuit=False):
     """ Attempts to fit two features with based on a shift parameter.
         Returns shift_min_final (m/s), shift_min_final_err (m/s), valid 
         """
@@ -613,6 +649,8 @@ def compute_feature_shift(x1, y1, y1_err, peak1, x2, y2, peak2, plot=False, ax=N
         # return shift_min_final, shift_min_final_err, valid, minuit.fval, new_peak1_wavel, new_peak2_wavel
         
         return shift_min_final, shift_min_final_err, valid, minuit.fval
+    elif return_minuit:
+        return minuit
     else:
         return shift_min_final, shift_min_final_err, valid#, minuit
 
@@ -648,12 +686,15 @@ def compute_all_feature_shifts(matches, log=True, plot=False, ax=[], interp_size
     return shifts
 
 
-def analyse_and_plot_shifts(path, file_index1, file_index2, bary=True):
+def analyse_and_plot_shifts(path, file_index1, file_index2, bary=True, match_function=1):
     """ Short hand function to compute and plot shifts between two files """
 
     filenames = get_spectra_filenames_without_duplicate_dates(path)
     file1, file2 = filenames[file_index1], filenames[file_index2]
-    matches = find_feature_matches2(find_features(file1, use_bary_correction=bary), find_features(file2, use_bary_correction=bary))
+    if match_function == 1:
+        matches = find_feature_matches(find_features(file1, use_bary_correction=bary), find_features(file2, use_bary_correction=bary))
+    elif match_function == 2:
+        matches = find_feature_matches2(find_features(file1, use_bary_correction=bary), find_features(file2, use_bary_correction=bary))
 
     # Compute how many rows we need to display all
     height = 1
@@ -788,6 +829,14 @@ def plot_features_shift_matrix(result, coords, save_to_filename=None, do_not_sho
         plt.close(fig) # don't show figure
 
 
+def unpack_columns_to_arrays(ndarray):
+    Ncols = len(ndarray[0])
+    cols = []
+    for n in np.arange(Ncols):
+        cols.append(np.asarray(ndarray[:, n]))
+    return cols
+
+
 def parse_matrix_results(result, coords, median_err=False, use_median=True):
     
     size = np.max(np.max(coords)) + 1
@@ -823,6 +872,111 @@ def parse_matrix_results(result, coords, median_err=False, use_median=True):
     return diff_matrix, diff_matrix_err, diff_matrix_valid
 
 
+
+def parse_matrix_results_fit(result, coords):
+    """ Instead of taking weighted average, fit a straight line. This should
+        give less attention to outliers. """
+    
+    size = np.max(np.max(coords)) + 1
+    diff_matrix, diff_matrix_err, diff_matrix_valid = make_nan_matrix(size), make_nan_matrix(size), make_nan_matrix(size)
+
+    for coord, shifts in zip(coords, result):
+
+        # Compute valid ratio, number of succesfull fits / total number of fits
+        valids = shifts[:, 2]
+        valid_ratio = len(valids[valids == 1])/len(valids)
+
+        # Split 
+        shifts_list, shifts_err_list, shifts_valid_list = shifts[:, 0], shifts[:, 1], shifts[:, 2]
+        
+        # Compute weighted average
+        shift_mean, shift_mean_err = weighted_mean(shifts_list[shifts_valid_list == 1], shifts_err_list[[shifts_valid_list == 1]])
+
+        x = coord[0]
+        y = coord[1]
+
+        diff_matrix[x, y] = shift_mean
+        diff_matrix_err[x, y] = shift_mean_err
+        diff_matrix_valid[x, y] = valid_ratio
+        
+    return diff_matrix, diff_matrix_err, diff_matrix_valid
+
+
+def fit_straight_line(x, y, y_err, init_value):
+    
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.errorbar(x, y, yerr=y_err, fmt=".", color="k")
+
+    # Fitting functions:
+    def func(x, a) :
+        return a
+
+    # ChiSquare fit model:
+    def model_chi(a) :
+        y_fit = func(x, a)
+        chi2 = np.sum(((y - y_fit) / y_err)**2)
+        return chi2
+    model_chi.errordef = 1
+
+    minuit = Minuit(model_chi, a=init_value)
+    m = minuit.migrad()        
+                        
+    # Plot result
+    xPeak = np.linspace(x[0], x[len(x)-1], 100)
+    ax.plot(xPeak, func(xPeak, *minuit.values[:]), '-r')
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+
+    Npoints = len(x)
+    Nvar = 1                                        # Number of variables
+    Ndof_fit = Npoints - Nvar                       # Number of degrees of freedom = Number of data points - Number of variables
+    Chi2_fit = minuit.fval                          # The chi2 value
+    Prob_fit = stats.chi2.sf(Chi2_fit, Ndof_fit)    # The chi2 probability given N degrees of freedom
+
+    a, a_err = minuit.values['a'], minuit.errors['a']
+
+    d = {'a':   [a, a_err],
+        'Chi2':     Chi2_fit,
+        'ndf':      Ndof_fit,
+        'Prob':     Prob_fit,
+        'f(x)=':    "a"
+    }
+
+    text = nice_string_output(d, extra_spacing=2, decimals=5)
+    add_text_to_ax(0.62, 0.95, text, ax, fontsize=14, color='r')
+    
+    return a, m
+
+
+
+def parse_matrix_results_df(result, coords):
+    
+    size = np.max(np.max(coords)) + 1
+    diff_matrix, diff_matrix_err, diff_matrix_valid = make_nan_matrix(size), make_nan_matrix(size), make_nan_matrix(size)
+
+    for coord, shifts in zip(coords, result):
+
+        # Split 
+        # shift, shift_err, shift_valid = shifts[0], shifts[1], shifts[3]
+        shift = np.median(shifts.shift_val)
+        w_mean, w_error = weighted_mean(shifts.shift_val, shifts.shift_err)
+    
+        # Compute valid ratio
+        n_total = len(shifts)
+        n_valid = len(shifts[shifts.minuit_valid])
+        valid_ratio = n_valid / n_total
+
+        x = coord[0]
+        y = coord[1]
+
+        diff_matrix[x, y] = shift
+        diff_matrix_err[x, y] = w_error
+        diff_matrix_valid[x, y] = valid_ratio
+        
+    return diff_matrix, diff_matrix_err, diff_matrix_valid
+
+
+
 def get_above_diagonal(matrix):
     """ returns returns the above diagonal in a mtrix """
     size = matrix.shape[0]
@@ -834,6 +988,20 @@ def get_above_diagonal(matrix):
     return off_diag
 
 
+def get_time_interval_between_observations(dates):
+    from datetime import datetime
+    """ Returns list of date pairs, between which each observation is made """
+    intervals = []
+    first_day = datetime(*dates[0])
+    for i in np.arange(len(dates) - 1):
+        d1 = datetime(*dates[i])
+        d2 = datetime(*dates[i+1])
+        dd1 = d1 - first_day
+        dd2 = d2 - first_day
+        intervals.append([dd1.days, dd2.days])
+    return np.asarray(intervals)
+    
+
 def compute_z_test_mask(x, sigma):
     """ Returns a mask with TRUEs if values are within the given number of 
     sigmas from the mean of the array """
@@ -844,14 +1012,14 @@ def compute_z_test_mask(x, sigma):
     return mask
 
 
-def filter_z_test(shifts, set_to_nan=False):
+def filter_z_test(shifts, set_to_nan=False, sigma=5):
     """ return filtered shifts collection by z test of sigma 5 """
     
     # Filter
     df = pd.DataFrame(shifts, copy=True)
     df.columns = ["x", "err", "valid"]
 
-    mask = compute_z_test_mask(df["x"], 5)
+    mask = compute_z_test_mask(df["x"], sigma)
 
     if set_to_nan:
         df.valid[mask == False] = np.nan 
@@ -872,6 +1040,13 @@ def filter_z_test_result(result, set_to_nan=False):
     filtered_result = np.asarray(filtered_result, dtype=object)
     return filtered_result
 
+def matrix_reduce_results_file_df(filename, path, plot=True):
+    """ Takes a file of our cross-correlation results (matrix) and reduces"""
+
+    result, coords = np.load(filename, allow_pickle=True)
+    diff_matrix, diff_matrix_err, diff_matrix_valid = parse_matrix_results_df(result, coords)
+    return matrix_reduce(diff_matrix, diff_matrix_err, diff_matrix_valid, path, plot)
+
 
 def matrix_reduce_results_file(filename, path, plot=True, with_date_duplicates=False):
     """ Takes a file of our cross-correlation results (matrix) and reduces"""
@@ -881,7 +1056,7 @@ def matrix_reduce_results_file(filename, path, plot=True, with_date_duplicates=F
     return matrix_reduce(diff_matrix, diff_matrix_err, diff_matrix_valid, path, plot, with_date_duplicates)
 
 
-def matrix_reduce(diff_matrix, diff_matrix_err, diff_matrix_valid, path, plot=True, with_date_duplicates=False):
+def matrix_reduce(diff_matrix, diff_matrix_err, diff_matrix_valid, path, plot=True, with_date_duplicates=False, center_around_zero=True):
     """ Takes a file of our cross-correlation results (matrix) and reduces"""
 
     def model_chi2(*V):
@@ -905,7 +1080,8 @@ def matrix_reduce(diff_matrix, diff_matrix_err, diff_matrix_valid, path, plot=Tr
     final_shifts_err = minuit.errors[:]
 
     # Center around 0
-    final_shifts = final_shifts - np.mean([min(final_shifts), max(final_shifts)])
+    if center_around_zero:
+        final_shifts = final_shifts - np.mean([min(final_shifts), max(final_shifts)])
 
     # get list of observation days
     if with_date_duplicates:
@@ -956,6 +1132,137 @@ def matrix_reduce(diff_matrix, diff_matrix_err, diff_matrix_valid, path, plot=Tr
     fig.tight_layout()
     # fig.savefig("rooo.png", dpi=300)
     return m, final_shifts, final_shifts_err, days
+
+
+def matrix_reduce_results_rms(diff_matrix, plot=True):
+
+    def model_chi2(*V):
+        V = np.asarray([*V])
+        res = []
+        size = diff_matrix.shape[0] 
+        # V = np.ones(size)
+        for x in np.arange(size):
+            # for y in np.arange(x, size - 1):
+            for y in np.arange(x, size):
+                if x != y:
+                    diff_matrix[x, y]
+                    V[x]
+                    V[y]
+                    res.append(((diff_matrix[x, y] - (V[x] - V[y])) / diff_matrix[x, y] * 0.001 )**2)
+        chi2 = np.sum(res)
+        return chi2
+    model_chi2.errordef = 1
+
+    # Use the above diagonal as init values
+    # init_values = get_above_diagonal(diff_matrix)
+    init_values = np.zeros(diff_matrix.shape[0])
+
+    minuit = Minuit(model_chi2, *init_values)
+    m = minuit.migrad()
+    final_shifts = minuit.values[:]
+    final_shifts_err = minuit.errors[:]
+
+    if plot == False:
+        return m, final_shifts, final_shifts_err
+
+    # Plot: 
+
+    # The velocity shifts are between days, so let's put the x-error bar as the time span for each data point
+    velocity_shifts = get_above_diagonal(diff_matrix)
+    velocity_shifts_err = velocity_shifts * 0.001
+    dates = get_spectra_dates(get_spectra_filenames_without_duplicate_dates())
+    days = convert_dates_to_relative_days(dates)
+
+    fig, (ax1, ax2) = plt.subplots(ncols=2, figsize=(20, 8))
+
+    ax1.set_xlabel("Time [days]")
+    ax1.set_ylabel("Velocity shift [cm/s]")
+    ax1.set_title("Above diagonal")
+
+    ax2.set_xlabel("Time [days]")
+    ax2.set_title("Matrix chi2 reduction")
+
+    # Plot above-diagonal
+    for shift, shift_err, d in zip(velocity_shifts, velocity_shifts_err, days):
+        ax1.errorbar(d, shift, yerr=shift_err, fmt=".", color="k")
+
+    # Plot matrix reduction results
+    for shift, shift_err, d in zip(final_shifts, final_shifts_err, days):
+        ax2.errorbar(d, shift, yerr=0, fmt=".", color="k")
+
+
+    fig.tight_layout()
+    # fig.savefig("rooo.png", dpi=300)
+    return m, final_shifts, final_shifts_err
+
+
+
+# def matrix_reduce_results_file_df(filename, plot=True):
+#     """ Takes a file of our cross-correlation results (matrix) and reduces"""
+#     result, coords = np.load(filename, allow_pickle=True)
+#     diff_matrix, diff_matrix_err, diff_matrix_valid = parse_matrix_results_df(result, coords)
+
+#     def model_chi2(*V):
+#         V = np.asarray([*V])
+#         res = []
+#         size = diff_matrix.shape[0] 
+#         # V = np.ones(size)
+#         for x in np.arange(size):
+#             for y in np.arange(x, size - 1):
+#                 if x != y:
+#                     diff_matrix[x, y]
+#                     V[x]
+#                     V[y]
+#                     res.append(((diff_matrix[x, y] - (V[x] - V[y])) / diff_matrix_err[x, y])**2)
+#         chi2 = np.sum(res)
+#         return chi2
+#     model_chi2.errordef = 1
+
+#     # Use the above diagonal as init values
+#     init_values = get_above_diagonal(diff_matrix)
+
+#     minuit = Minuit(model_chi2, *init_values)
+#     m = minuit.migrad()
+#     final_shifts = minuit.values[:]
+#     final_shifts_err = minuit.errors[:]
+
+#     if plot == False:
+#         return m, final_shifts, final_shifts_err
+
+#     # Plot: 
+
+#     # The velocity shifts are between days, so let's put the x-error bar as the time span for each data point
+#     velocity_shifts = get_above_diagonal(diff_matrix)
+#     velocity_shifts_err = get_above_diagonal(diff_matrix_err)
+#     dates = get_spectra_dates(get_spectra_filenames_without_duplicate_dates())
+#     intervals = get_time_interval_between_observations(dates)
+
+#     fig, (ax1, ax2) = plt.subplots(ncols=2, figsize=(20, 8))
+
+#     ax1.set_xlabel("Time [days]")
+#     ax1.set_ylabel("Velocity shift [cm/s]")
+#     ax1.set_title("Above diagonal")
+
+#     ax2.set_xlabel("Time [days]")
+#     ax2.set_title("Matrix chi2 reduction")
+
+#     # Plot above diagonal
+#     for shift, shift_err, interval in zip(velocity_shifts, velocity_shifts_err, intervals):
+#         # print(shift, np.diff(interval), interval)
+#         days_interval = np.arange(*interval)
+#         ax1.plot(days_interval, [shift] * len(days_interval), linewidth=2, color="k")
+#         ax1.errorbar(np.median(days_interval), shift, yerr=shift_err, color="k") # add errorbar to the center point
+
+#     # Plot matrix reduction results
+#     for shift, shift_err, interval in zip(final_shifts, final_shifts_err, intervals):
+#         days_interval = np.arange(*interval)
+#         ax2.plot(days_interval, [shift] * len(days_interval), linewidth=2, color="k")
+#         ax2.errorbar(np.median(days_interval), shift, yerr=shift_err, color="k") # add errorbar to the center point
+
+#     fig.tight_layout()
+#     # fig.savefig("rooo.png", dpi=300)
+
+#     return m, final_shifts, final_shifts_err
 
 
 def fit_final_shifts(rv, rv_err, diff_matrix, diff_matrix_err, with_date_duplicates=True, save_as=None, path=SPECTRA_PATH_34411):
@@ -1038,173 +1345,6 @@ def fit_final_shifts(rv, rv_err, diff_matrix, diff_matrix_err, with_date_duplica
     if save_as is not None:
         fig.savefig(save_as, bbox_inches="tight", dpi=300)
         
-
-
-
-def plot_matches(matches, valid_matches_mask=None, ncols=10, nrows=-1, return_fig=False):
-    """ Plots matches """
-
-    if nrows == -1:
-        nrows = 1
-        while nrows * ncols < len(matches):
-            nrows += 1
-
-    assert nrows < 100, "Height is higher than 100"
-
-    # Plot matches
-    fig, axs = plt.subplots(nrows=nrows, ncols=ncols, figsize=(ncols * 2, nrows * 1.5))
-    for k in np.arange(len(matches)):
-        match = matches[k]
-
-        if k >= len(axs.flat):
-            break
-
-        ax = axs.flat[k]
-        plot_match(match, ax)
-
-        # if np.isclose(np.sum(spec1), np.sum(spec2), 0.1) == False:
-        #     ax.set_facecolor('pink')
-
-        if valid_matches_mask is not None and (valid_matches_mask[k] == False):
-            ax.set_facecolor('pink')
-
-    fig.subplots_adjust(top = 0.99, bottom=0.01, hspace=0.4, wspace=0.05)
-
-    # Remove ticks
-    for ax in axs.flat:
-        ax.axes.xaxis.set_ticklabels([])
-        ax.axes.yaxis.set_ticklabels([])
-        ax.axes.xaxis.set_ticks([])
-        ax.axes.yaxis.set_ticks([])
-
-    if return_fig:
-        return fig
-
-
-def plot_match(match, ax=None):
-    matplotlib.rcParams["text.usetex"] = False
-
-    if ax is None:
-        fig, ax = plt.subplots(figsize=(6,3))
-    
-    f1 = match[0]
-    f2 = match[1]
-    wavel1 = f1[0]
-    spec1 = f1[1]
-    peak1 = f1[3]
-    wavel2 = f2[0]
-    spec2 = f2[1]
-    peak2 = f2[3]
-
-    # Plot
-    ax.plot(wavel1, spec1, color="C0")
-    ax.vlines(peak1, 0, 1, linestyle="dashed", color="C0")
-    ax.plot(wavel2, spec2, color="C3")
-    ax.vlines(peak2, 0, 1, linestyle="dashed", color="C3")
-
-    # Plot peak difference
-    diff = peak1 - peak2
-    area_diff = np.abs(np.sum(spec1) - np.sum(spec2))
-    text = f"Δλ = {diff:.3f} Å \nΔA = {area_diff:.3f}"
-    ax.text(0.02, -0.2, text, horizontalalignment='left', verticalalignment='center', transform=ax.transAxes)
-    matplotlib.rcParams["text.usetex"] = True
-
-
-def plot_compare_lily(my_rv, my_err, days, save_as = None, star_name=None, 
-            plot_residuals=False, lily_data_file=None, padding_top=4, padding_bottom=1, ticks=None, small_height=False):
-
-    height = 4 if small_height else 5
-    info_text_y_loc = 0.93 if small_height else 0.95
-
-    fig, (ax1, ax2, ax3) = plt.subplots(nrows=3, figsize=(8, height), sharex=True, gridspec_kw={'height_ratios': [3, 3, 1.5]})
-
-    # Load Lily data:
-    df = pd.read_csv("lily_stellar_activity_data/" + lily_data_file)
-    rv = df["CBC RV [m/s]"]
-    rv_err = df["CBC RV Err. [m/s]"]
-
-    # Find range
-    ymin = floor(min([min(rv), min(my_rv)])) - padding_bottom
-    ymax = ceil(max([max(rv), max(my_rv)])) + padding_top
-    print(ymin, ymax)
-
-    if ticks:
-        ax1.yaxis.set_ticks(ticks)
-        ax2.yaxis.set_ticks(ticks)
-
-    ax1.set_ylabel("RV shift [m/s]")
-    ax1.errorbar(days, my_rv, yerr=my_err, fmt=".", color="k", ms=1, elinewidth=0.5, label="My method")
-    ax1.set_ylim(ymin, ymax)
-    ax1.set_xlim(-20, max(days) + 20)
-    ax1.hlines(y=0, xmin=-20, xmax=max(days) + 20, color="black", alpha=0.25, lw=0.1)
-    ax1.legend(loc="upper left", prop={'size': 8})
-    text = f"rms = {(compute_rms(my_rv)):.3} m/s, mean error = {np.mean(my_err):.2} m/s"
-    ax1.text(0.19, info_text_y_loc, text,
-                        size = 8,
-                        horizontalalignment='left',
-                        verticalalignment='top',
-                        transform=ax1.transAxes)
-
-    if star_name:
-        ax1.text(0.99, info_text_y_loc, star_name,
-                        size = 8,
-                        horizontalalignment='right',
-                        verticalalignment='top',
-                        transform=ax1.transAxes)
-
-
-    
-    t = df["Time [MJD]"]
-    t = t - min(t)
-    rms2 = compute_rms(rv)
-
-    ax2.errorbar(t, rv, yerr=rv_err, fmt=".", ms=1, color="k", elinewidth=0.5, label="Lily Zhao et al's method")
-    ax2.set_ylabel("RV shift [m/s]")
-    ax2.set_ylim(ymin, ymax)
-    ax2.set_xlim(-20, max(t) + 20)
-    ax2.hlines(y=0, xmin=-20, xmax=max(t) + 20, color="black", alpha=0.25, lw=0.1)
-    ax2.legend(loc="upper left", prop={'size': 8})
-
-    text = f"rms = {(rms2):.3} m/s, mean error = {np.mean(rv_err):.2f} m/s"
-    ax2.text(0.30, info_text_y_loc, text,
-                        size = 8,
-                        horizontalalignment='left',
-                        verticalalignment='top',
-                        transform=ax2.transAxes)
-
-    # ax1.get_shared_x_axes().join(ax1, ax2)
-
-    # ax1.sharex(ax3)
-    # ax2.sharex(ax3)
-    fig.subplots_adjust(wspace=0, hspace=0)
-    # fig.tight_layout()
-
-    # plot residuals
-    residuals = my_rv - rv
-    ax3.scatter(t, residuals, s=0.5, color="k")
-    ax3.set_xlabel("Time [days]")
-    ax3.set_ylabel("Residuals")
-    ax3.yaxis.set_ticks([-2, 0, 2])
-    ax3.hist(residuals, orientation='horizontal', range=(-2.5, 2.5), bins=int(np.sqrt(len(residuals))), alpha=0.1, color="k", bottom=-20)
-
-
-    if save_as is not None:
-        fig.savefig(save_as, bbox_inches="tight", dpi=300)
-
-    # Histogram of residuals if same length
-    if plot_residuals:
-        if len(rv) == len(my_rv):
-
-            fig, ax = plt.subplots(figsize=(6,0.5))
-            ax.plot(t, my_rv - rv, ".", ms=0.5)
-            ax.set_ylabel("Residuals [m/s]")
-            ax.set_xlabel("Days")
-
-            fig, (ax1, ax2) = plt.subplots(ncols=2, figsize=(6,1.5))
-            ax1.hist(my_rv - rv, bins=50, range=(-5, 5));
-            ax2.scatter(my_rv, rv, s=0.5)
-
-
 
 # ================================================================================================
 # 
@@ -1466,4 +1606,361 @@ def compute_all_orders_shift(filename1, filename2, plot_overview=False, plot_ord
 
 
 
+
+
+
 # ================================================================================================
+
+def plot_matches(matches, valid_matches_mask=None, ncols=10, nrows=-1, return_fig=False):
+    """ Plots matches """
+
+    if nrows == -1:
+        nrows = 1
+        while nrows * ncols < len(matches):
+            nrows += 1
+
+    assert nrows < 100, "Height is higher than 100"
+
+    # Plot matches
+    fig, axs = plt.subplots(nrows=nrows, ncols=ncols, figsize=(ncols * 2.5, nrows * 2))
+    for k in np.arange(len(matches)):
+        match = matches[k]
+
+        if k >= len(axs.flat):
+            break
+
+        ax = axs.flat[k]
+        plot_match(match, ax)
+
+        # if np.isclose(np.sum(spec1), np.sum(spec2), 0.1) == False:
+        #     ax.set_facecolor('pink')
+
+        if valid_matches_mask is not None and (valid_matches_mask[k] == False):
+            ax.set_facecolor('pink')
+
+    fig.subplots_adjust(top = 0.99, bottom=0.01, hspace=0.4, wspace=0.05)
+
+    # Remove ticks
+    for ax in axs.flat:
+        ax.axes.xaxis.set_ticklabels([])
+        ax.axes.yaxis.set_ticklabels([])
+        ax.axes.xaxis.set_ticks([])
+        ax.axes.yaxis.set_ticks([])
+
+    if return_fig:
+        return fig
+
+
+def plot_match(match, ax=None):
+    matplotlib.rcParams["text.usetex"] = False
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(6,3))
+    
+    f1 = match[0]
+    f2 = match[1]
+    wavel1 = f1[0]
+    spec1 = f1[1]
+    peak1 = f1[3]
+    wavel2 = f2[0]
+    spec2 = f2[1]
+    peak2 = f2[3]
+
+    # Plot
+    ax.plot(wavel1, spec1, color="C0")
+    ax.vlines(peak1, 0, 1, linestyle="dashed", color="C0")
+    ax.plot(wavel2, spec2, color="C3")
+    ax.vlines(peak2, 0, 1, linestyle="dashed", color="C3")
+
+    # Plot peak difference
+    diff = peak1 - peak2
+    area_diff = np.abs(np.sum(spec1) - np.sum(spec2))
+    text = f"Δλ = {diff:.3f} Å \nΔA = {area_diff:.3f}"
+    ax.text(0.02, -0.2, text, horizontalalignment='left', verticalalignment='center', transform=ax.transAxes)
+    matplotlib.rcParams["text.usetex"] = True
+
+
+from scipy.special import erfc
+def chauvenet(array):
+    '''
+        Source: https://www.kaggle.com/nroman/detecting-outliers-with-chauvenet-s-criterion
+        return true/false array with false if data point should be discarded
+    '''
+    mean = np.mean(array)                   # Mean of incoming array
+    stdv = np.std(array)                    # Standard deviation
+    
+    if stdv == 0:
+        # if std is zero, say that it's bad..
+        return False
+
+    N = len(array)                          # Lenght of incoming array
+    criterion = 1.0/(2*N)                   # Chauvenet's criterion
+    d = np.abs(array-mean)/stdv             # Distance of a value to mean in stdv's
+    prob = np.array([erfc(x) for x in d])   # Area normal dist.    
+    return (prob > criterion)               # Use boolean array outside this function
+
+
+def run_chauvenet(array, errors, valid):
+    """ Computes and applies a chauvenet mask until the length of the array reaches a minimum """
+    size = len(array) + 1       # have to make it larger to make the loop start...
+    while len(array) < size and len(array) > 10:    # keep running as long the new size is still smaller and it's not empty (i.e. less than 10...)
+        size = len(array)
+        chauvenet_mask = chauvenet(array)
+        array = array[chauvenet_mask]
+        errors = errors[chauvenet_mask]
+        valid = valid[chauvenet_mask]
+    return array, errors, valid
+
+
+def remove_outliers_from_result_with_chauvenet(res, log=False):
+    result_new = []
+    for r, i in zip(res, np.arange(len(res))):
+        rvs = r[:, 0]
+        rvs_err = r[:, 1]
+        rvs_valid = r[:, 2]
+        new_rv, new_rv_err, new_rv_valid = run_chauvenet(rvs, rvs_err, rvs_valid)
+        result_new.append(np.column_stack([new_rv, new_rv_err, new_rv_valid]))
+        if log:
+            print(f"Removed {len(rvs) - len(new_rv)} from {len(rvs)} to give {len(new_rv)}")
+    return np.asarray(result_new)
+
+
+
+def remove_outliers_from_result_with_rv_cut(res):
+    result_new = []
+    for r in res:
+        df = pd.DataFrame(r)
+        df.columns = ["rv", "err", "valid"]
+        df = df[np.abs(df.rv) < 12.5]
+        result_new.append(np.asarray(df))
+    return np.asarray(result_new)
+
+
+def plot_compare_lily(my_rv, my_err, days, save_as = None, star_name=None, 
+            plot_residuals=False, lily_data_file=None, padding_top=4, padding_bottom=1, ticks=None, small_height=False, draw_grid=False):
+
+    height = 4 if small_height else 5
+    info_text_y_loc = 0.93 if small_height else 0.95
+
+    fig, (ax1, ax2, ax3) = plt.subplots(nrows=3, figsize=(8, height), sharex=True, gridspec_kw={'height_ratios': [3, 3, 1.5]})
+
+    # Load Lily data:
+    df = pd.read_csv("lily_stellar_activity_data/" + lily_data_file)
+    rv = df["CBC RV [m/s]"]
+    rv_err = df["CBC RV Err. [m/s]"]
+
+    # Find range
+    ymin = floor(min([min(rv), min(my_rv)])) - padding_bottom
+    ymax = ceil(max([max(rv), max(my_rv)])) + padding_top
+    print(ymin, ymax)
+
+    if ticks:
+        ax1.yaxis.set_ticks(ticks)
+        ax2.yaxis.set_ticks(ticks)
+
+    ax1.set_ylabel("RV shift [m/s]")
+    ax1.errorbar(days, my_rv, yerr=my_err, fmt=".", color="k", ms=1, elinewidth=0.5, label="My method")
+    ax1.set_ylim(ymin, ymax)
+    ax1.set_xlim(-20, max(days) + 20)
+    ax1.hlines(y=0, xmin=-20, xmax=max(days) + 20, color="black", alpha=0.25, lw=0.1)
+    ax1.legend(loc="upper left", prop={'size': 8})
+    text = f"rms = {(compute_rms(my_rv)):.3} m/s, mean error = {np.mean(my_err):.2} m/s"
+    ax1.text(0.19, info_text_y_loc, text,
+                        size = 8,
+                        horizontalalignment='left',
+                        verticalalignment='top',
+                        transform=ax1.transAxes)
+
+    if star_name:
+        ax1.text(0.99, info_text_y_loc, star_name,
+                        size = 8,
+                        horizontalalignment='right',
+                        verticalalignment='top',
+                        transform=ax1.transAxes)
+
+
+    
+    t = df["Time [MJD]"]
+    t = t - min(t)
+    rms2 = compute_rms(rv)
+
+    ax2.errorbar(t, rv, yerr=rv_err, fmt=".", ms=1, color="k", elinewidth=0.5, label="Lily Zhao et al's method")
+    ax2.set_ylabel("RV shift [m/s]")
+    ax2.set_ylim(ymin, ymax)
+    ax2.set_xlim(-20, max(t) + 20)
+    ax2.hlines(y=0, xmin=-20, xmax=max(t) + 20, color="black", alpha=0.25, lw=0.1)
+    ax2.legend(loc="upper left", prop={'size': 8})
+
+    text = f"rms = {(rms2):.3} m/s, mean error = {np.mean(rv_err):.2f} m/s"
+    ax2.text(0.30, info_text_y_loc, text,
+                        size = 8,
+                        horizontalalignment='left',
+                        verticalalignment='top',
+                        transform=ax2.transAxes)
+
+    # ax1.get_shared_x_axes().join(ax1, ax2)
+
+    # ax1.sharex(ax3)
+    # ax2.sharex(ax3)
+    fig.subplots_adjust(wspace=0, hspace=0)
+    # fig.tight_layout()
+
+    # plot residuals
+    residuals = my_rv - rv
+    ax3.scatter(t, residuals, s=0.5, color="k")
+    ax3.set_xlabel("Time [days]")
+    ax3.set_ylabel("Residuals")
+    ax3.yaxis.set_ticks([-2, 0, 2])
+    ax3.hist(residuals, orientation='horizontal', range=(-2.5, 2.5), bins=int(np.sqrt(len(residuals))), alpha=0.1, color="k", bottom=-20)
+
+    if draw_grid:
+        ax_add_grid(ax1)
+        ax_add_grid(ax2)
+        ax_add_grid(ax3)
+
+    if save_as is not None:
+        fig.savefig(save_as, bbox_inches="tight", dpi=300)
+
+    # Histogram of residuals if same length
+    if plot_residuals:
+        if len(rv) == len(my_rv):
+
+            fig, ax = plt.subplots(figsize=(6,0.5))
+            ax.plot(t, my_rv - rv, ".", ms=0.5)
+            ax.set_ylabel("Residuals [m/s]")
+            ax.set_xlabel("Days")
+
+            fig, (ax1, ax2) = plt.subplots(ncols=2, figsize=(6,1.5))
+            ax1.hist(my_rv - rv, bins=50, range=(-5, 5));
+            ax2.scatter(my_rv, rv, s=0.5)
+
+
+def make_gif(read_dir, save_as, must_contain=None, use_nth_file=1, fps=30):
+    image_files = get_files_in_dir(read_dir, must_contain=must_contain)[::use_nth_file]
+
+    # need to sort them again, don't know why ... 
+    import natsort 
+    image_files = natsort.natsorted(image_files, reverse=False)
+    image_files
+
+    import imageio
+    images = []
+    for filename in image_files:
+        im = imageio.imread(filename)
+        images.append(im)
+    imageio.mimsave(save_as, images, fps=fps)
+
+
+def ax_add_grid(ax):
+    ax.xaxis.set_minor_locator(matplotlib.ticker.AutoMinorLocator())
+    ax.yaxis.set_minor_locator(matplotlib.ticker.AutoMinorLocator())
+    ax.grid(which='major', color='k', alpha=0.05, linestyle='-')
+    ax.grid(which='minor', color='k', alpha=0.025, linestyle='-')
+
+
+def match_k_features(filenames, correct_for_tellurics=False, log=True, min_feature_count_in_k=50, max_feature_count_in_k=60):
+    all_features = [find_features(file, log=False, apply_order_overlap_masking=True, correct_for_tellurics=correct_for_tellurics) for file in filenames]
+
+    # Extract wavelength of all features
+    feature_wavelengths = []
+    for f in all_features:
+        list = [f[i][3] for i in range(len(f))]
+        feature_wavelengths.append(list)
+    feature_wavelengths = np.concatenate(feature_wavelengths)
+
+    # Do numpy histogram to get count and bin_edges with larger bin size
+    xmin, xmax = np.min(feature_wavelengths), np.max(feature_wavelengths)
+    Nbins = 100000
+    count, bin_edges = np.histogram(feature_wavelengths, bins=Nbins, range=(xmin, xmax))
+    bin_centers = (bin_edges[1:] + bin_edges[:-1])/2
+    bin_width = (xmax-xmin)/Nbins
+
+    # remove features that are overlaping (if any ..)
+    count[np.where(count > max_feature_count_in_k)] = 0
+
+    # remove features that are not present throughout most observations (50+)
+    count[np.where(count < min_feature_count_in_k)] = 0
+
+    # Find peaks in histogram
+    from findpeaks import findpeaks  # (https://erdogant.github.io/findpeaks/pages/html/Peakdetect.html)
+    fp = findpeaks(lookahead=1, interpolate=10) # todo: what do these params do? 
+    results = fp.fit(count)
+
+    # get df from results
+    res_df = results["df"]
+
+    # exclude points that are not peaks (such as valleys)
+    res_df = res_df[res_df.peak]
+
+    # get peak index and height
+    peak_index = res_df.x 
+    peak_height = res_df.y 
+
+    # Remove "peaks" that are below 50 (a lot around zero...)
+    peak_index = peak_index[peak_height > 50]
+    peak_height = peak_height[peak_height > 50]
+
+    # get wavelength of bin-centers
+    peak_wavelength = bin_centers[peak_index]
+
+    # Make dataframe of all features
+    df_all_features = []
+    days = convert_dates_to_relative_days(get_spectra_dates(filenames))
+    for obs, day, i in zip(all_features, days, range(len(all_features))):
+        for f in obs:
+            fdf = pd.DataFrame({
+                "k": np.nan,   # add k, ready to assign 
+                "obs": i,
+                "day": day,
+                "x": [f[0]],
+                "y": [f[1]],
+                "y_err": [f[2]],
+                "x_peak": f[3],
+                "x_peak_index": f[4],
+                "order": f[5]
+            })
+            df_all_features.append(fdf)
+
+    df_all_features = pd.concat(df_all_features, ignore_index=True)
+
+    # Loop through all features
+    for i in range(len(df_all_features)):
+        
+        # get feature peak (wavelength)
+        feature_peak = df_all_features.iloc[i].x_peak
+        
+        # loop through all k wavelengths
+        for k, λ in enumerate(peak_wavelength):
+
+            # check if feature peak is in the bin of wavelength k, if so asign. 
+            if λ > feature_peak - bin_width and λ < feature_peak + bin_width:
+                df_all_features.loc[i, "k"] = k
+                break
+
+    if log:
+        print(f"Categorized {len(df_all_features[df_all_features.k >= 0])} features with k ranging from 0 to {np.nanmax(df_all_features.k)}. {(len(df_all_features[df_all_features.k >= 0])/len(df_all_features) * 100):.3}% of the found features.")
+
+    return df_all_features
+
+
+def parse_matrix_results_feature(result, coords):
+    
+    size = np.max(np.max(coords)) + 1
+    diff_matrix, diff_matrix_err, diff_matrix_valid = make_nan_matrix(size), make_nan_matrix(size), make_nan_matrix(size)
+
+    for coord, shifts in zip(coords, result):
+
+        # Split 
+        rv, err, valid = shifts[0], shifts[1], shifts[2]
+
+        x = coord[0]
+        y = coord[1]
+
+        diff_matrix[x, y] = rv
+        diff_matrix_err[x, y] = err
+        diff_matrix_valid[x, y] = valid
+        
+    return diff_matrix, diff_matrix_err, diff_matrix_valid
+
+
+
